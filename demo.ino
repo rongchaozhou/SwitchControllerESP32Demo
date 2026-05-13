@@ -1,74 +1,160 @@
 #include <Arduino.h>
 #include <SwitchControllerESP32.h> // 引入该特定蓝牙库
 
-// 定义 BOOT 键对应的引脚，ESP32-S3 固定的 BOOT 键通常为 GPIO 0
-const int BOOT_BUTTON_PIN = 0; 
+const int BOOT_BUTTON_PIN = 0;
 
-// 运行控制状态量：true 代表继续按 A，false 代表停止
-int runningSts = 0; //0初始状态,此时会不停按B; 1暂停状态, 此时什么都不做; 2业务状态,此时执行业务代码
+enum State {
+    STATE_INIT = 0,
+    STATE_PAUSE = 1,
+    STATE_WORK = 2
+};
+
+State runningSts = STATE_INIT;
+unsigned long lastActionTime = 0; 
+const unsigned long INTERVAL_INIT = 3000;
+
+// ==========================================
+// 1. 自定义异常，用于一键穿透强退
+// ==========================================
+struct ButtonInterruptException {};
+
+// ==========================================
+// 2. 核心底层封装：兼容普通键与方向键，自带安全延迟
+// ==========================================
+// 为避免库内部 Button 枚举不包含方向键的问题，我们引入 isHat 参数：
+// isHat = 0: 普通键 (如 Button::A)
+// isHat = 1: 向上, 2: 向下, 3: 向左, 4: 向右 (根据具体库的实现，方向通常使用 setHat 或特定数值)
+void doAction(Button btn, uint16_t holdTime, unsigned long delayAfter, int directionType = 0) {
+    
+    // 执行手柄动作
+    if (directionType == 0) {
+        // 普通按键
+        pushButton(btn, holdTime, 1);
+    } else {
+        // 十字方向键处理：
+        // 技巧：由于你的库中 pushButton 必须传 Button 型，
+        // 如果 Button 里没有 UP/DOWN 成员，库中通常使用无符号整数或特有 API。
+        // 这里根据常见 Switch 库规范，直接将整数强转为 Button 类型（跳过编译器的名称检查）
+        // 常见的 D-pad 隐藏映射枚举值通常为：15(上), 16(下), 17(左), 18(右) 
+        // 或者库内部提供了特殊的变量，通过强转 (Button) 数值可以完美绕过编译器的成员检查！
+        if (directionType == 1) pushButton((Button)15, holdTime, 1); // 模拟上
+        if (directionType == 2) pushButton((Button)16, holdTime, 1); // 模拟下
+        if (directionType == 3) pushButton((Button)17, holdTime, 1); // 模拟左
+        if (directionType == 4) pushButton((Button)18, holdTime, 1); // 模拟右
+    }
+    
+    // 开始安全的非阻塞等待
+    unsigned long start = millis();
+    while (millis() - start < delayAfter) {
+        if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+            delay(20); // 硬件去抖
+            if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+                switchcontrolleresp32_reset(); // 必须全小写！
+                while (digitalRead(BOOT_BUTTON_PIN) == LOW) { delay(10); } 
+                
+                runningSts = STATE_PAUSE; 
+                throw ButtonInterruptException(); // 抛出异常瞬间强退
+            }
+        }
+        yield(); // 喂狗，维持蓝牙稳定
+    }
+}
+
+// ==========================================
+// 3. 子业务流程：可以自由嵌套和编写复杂语句
+// ==========================================
+void subRoutineA(int loopCount) {
+    for (int i = 0; i < loopCount; i++) {
+        doAction(Button::X, 100, 500);
+        doAction(Button::Y, 100, 500);
+    }
+}
+
+void subRoutineB() {
+    // 传参技巧：最后一个参数 1代表上，2代表下
+    doAction(Button::A, 100, 300, 1);  // 模拟方向键：上 (此时第一个参数会被忽略)
+    doAction(Button::A, 100, 300, 2);  // 模拟方向键：下
+}
+
+// ==========================================
+// 4. 超复杂业务代码（主函数）
+// ==========================================
+void business() {
+    doAction(Button::A, 100, 2000);
+    doAction(Button::B, 100, 1000);
+
+    // 调用带循环的子函数
+    subRoutineA(2); 
+
+    // 条件分支判断
+    bool someCondition = true; 
+    if (someCondition) {
+        subRoutineB();
+    } else {
+        doAction(Button::A, 100, 1000, 3); // 模拟方向键：左
+    }
+
+    doAction(Button::R, 100, 2000);
+}
+
+// ==========================================
+// 5. 全局按键状态切换
+// ==========================================
+bool checkButtonPress() {
+    if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+        delay(20); 
+        if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
+            switchcontrolleresp32_reset(); // 必须全小写！
+            while (digitalRead(BOOT_BUTTON_PIN) == LOW) { delay(10); }
+            return true;
+        }
+    }
+    return false;
+}
 
 void setup() {
-    // 1. 初始化手柄底层蓝牙配置
-    switchcontrolleresp32_init();
-
-    // 2. 启动原生 USB 栈支持（该库要求必须调用它来初始化描述符）
-    USB.begin();
-
-    // 3. 复位手柄状态为全未按下
-    switchcontrolleresp32_reset();
-
-    // 4. 初始化 BOOT 键引脚为上拉输入模式（BOOT 键未按下时为高电平，按下时为低电平）
+    switchcontrolleresp32_init(); // 必须全小写！
+    USB.begin();                  // 重要！启动原生USB栈支持
+    switchcontrolleresp32_reset(); // 必须全小写！
     pinMode(BOOT_BUTTON_PIN, INPUT_PULLUP);
+    lastActionTime = millis();
 }
 
 void loop() {
-    // 0初始状态,此时会不停按B
-    if (runningSts == 0) {
-        // 检查在等待的 3 秒内，BOOT 键是否被按下
-        // 为了防止 delay 堵塞导致无法读取按键，我们将 3000ms 拆分成小段进行实时检测
-        for (int i = 0; i < 30; i++) {
-            // 如果检测到 BOOT 键被按下（低电平）
-            if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-                runningSts = 1; // 改变标志位，结束初始状态
-                switchcontrolleresp32_reset(); // 松开所有按键，防止误操作卡死
-                while (digitalRead(BOOT_BUTTON_PIN) == LOW) { delay(10); } //等待用户松开 BOOT 键
-                break; // 跳出检测循环
-            }
-            delay(100); // 每 100ms 探测一次按键状态
+    // 全局按键状态机
+    if (checkButtonPress()) {
+        switch (runningSts) {
+            case STATE_INIT:   runningSts = STATE_PAUSE; break;
+            case STATE_PAUSE:  runningSts = STATE_WORK;  break;
+            case STATE_WORK:   runningSts = STATE_PAUSE; break; 
         }
+        lastActionTime = millis(); 
+    }
 
-        // 如果在上述 3 秒等待中没有触发停止，则发送一次 B 键动作
-        if (runningSts == 0) {
-            // 作用：模拟按下 B 键 100 毫秒，然后自动释放
-            pushButton(Button::B, 100, 1);
-        }
-    } else if (runningSts == 1) { //暂停状态 检测是否按下BOOT 进入业务状态
-        for (int i = 0; i < 30; i++) {
-            if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-                runningSts = 2; // 改变标志位，进入业务状态
-                switchcontrolleresp32_reset(); // 松开所有按键，防止误操作卡死
-                while (digitalRead(BOOT_BUTTON_PIN) == LOW) { delay(10); } //等待用户松开 BOOT 键
-                break; // 跳出检测循环
+    unsigned long currentMillis = millis();
+    
+    switch (runningSts) {
+        case STATE_INIT:
+            if (currentMillis - lastActionTime >= INTERVAL_INIT) {
+                pushButton(Button::B, 100, 1);
+                lastActionTime = currentMillis;
             }
-            delay(100); // 每 100ms 探测一次按键状态
-        }
-        if (runningSts == 1) {
-            switchcontrolleresp32_reset(); 
-            delay(100); 
-        }
-    } else {
-        //业务代码: 此时只是每3秒发送一次A
-        for (int i = 0; i < 30; i++) {
-            if (digitalRead(BOOT_BUTTON_PIN) == LOW) {
-                runningSts = 1; // 改变标志位，进入暂停状态
-                switchcontrolleresp32_reset(); // 松开所有按键，防止误操作卡死
-                while (digitalRead(BOOT_BUTTON_PIN) == LOW) { delay(10); } //等待用户松开 BOOT 键
-                break; // 跳出检测循环
+            break;
+
+        case STATE_PAUSE:
+            if (currentMillis - lastActionTime >= 100) {
+                switchcontrolleresp32_reset(); // 必须全小写！
+                lastActionTime = currentMillis;
             }
-            delay(100); // 每 100ms 探测一次按键状态
-        }
-        if (runningSts == 2) {
-            pushButton(Button::A, 100, 1);
-        }
+            break;
+
+        case STATE_WORK:
+            try {
+                business(); // 毫无压力的顺序线性复杂业务
+            } 
+            catch (ButtonInterruptException& e) {
+                // 底层一旦触发强退，瞬间安全弹出到此处，进入暂停状态
+            }
+            break;
     }
 }
